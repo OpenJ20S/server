@@ -191,9 +191,14 @@ func setupTLS() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		CipherSuites: []uint16{
+			// HTTP/2 required
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			// Strong ciphers
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 		},
+		NextProtos: []string{"h2", "http/1.1"}, // Explicitly enable HTTP/2
 	}
 }
 
