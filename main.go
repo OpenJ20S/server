@@ -1135,7 +1135,7 @@ func main() {
 
 	// Запуск сервера
 	log.Println("Starting J20S server on :8080")
-	if err := srv.ListenAndServeTLS("server.crt", "server.key"); err != nil && err != http.ErrServerClosed {
+	if err := srv.ListenAndServeTLS("cert.pem", "key.pem"); err != nil && err != http.ErrServerClosed {
 		log.Fatal("Server failed:", err)
 	}
 }
