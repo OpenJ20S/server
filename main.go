@@ -1,74 +1,45 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
+	"context"
+	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/blake2b"
 )
-
-type Server struct {
-	clients   map[string]*Client
-	messages  map[string]*EncryptedMessage
-	mu        sync.RWMutex
-	gcm       cipher.AEAD
-	serverKey []byte
-	upgrader  websocket.Upgrader
-}
 
 type Client struct {
 	ID       string
 	Conn     *websocket.Conn
-	LastSeen time.Time
+	Send     chan []byte
+	server   *Server
+	lastSeen time.Time
 }
 
-type EncryptedMessage struct {
-	ID        string
-	Data      []byte
-	Nonce     []byte
-	AuthTag   []byte
-	Timestamp time.Time
-	TTL       time.Duration
+type Message struct {
+	Type      string    `json:"type"`
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
-type Packet struct {
-	Type      string `json:"type"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Data      []byte `json:"data"`
-	Timestamp int64  `json:"timestamp"`
+type Server struct {
+	clients    map[string]*Client
+	clientsMux sync.RWMutex
+	upgrader   websocket.Upgrader
 }
 
 func NewServer() *Server {
-	serverKey := make([]byte, 38)
-	if _, err := rand.Read(serverKey); err != nil {
-		log.Fatal("Failed to generate server key:", err)
-	}
-
-	aesKey := blake2b.Sum256(serverKey)
-	block, err := aes.NewCipher(aesKey[:32])
-	if err != nil {
-		log.Fatal("Failed to create AES cipher:", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		log.Fatal("Failed to create GCM:", err)
-	}
-
 	return &Server{
-		clients:   make(map[string]*Client),
-		messages:  make(map[string]*EncryptedMessage),
-		serverKey: serverKey,
-		gcm:       gcm,
+		clients: make(map[string]*Client),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -77,31 +48,29 @@ func NewServer() *Server {
 	}
 }
 
-func (s *Server) encryptMessage(data []byte) (*EncryptedMessage, error) {
-	nonce := make([]byte, s.gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+func (s *Server) addClient(client *Client) {
+	s.clientsMux.Lock()
+	defer s.clientsMux.Unlock()
+	s.clients[client.ID] = client
+}
+
+func (s *Server) removeClient(clientID string) {
+	s.clientsMux.Lock()
+	defer s.clientsMux.Unlock()
+	if client, exists := s.clients[clientID]; exists {
+		close(client.Send)
+		delete(s.clients, clientID)
 	}
-
-	ciphertext := s.gcm.Seal(nil, nonce, data, nil)
-
-	msgID := make([]byte, 16)
-	rand.Read(msgID)
-
-	return &EncryptedMessage{
-		ID:        fmt.Sprintf("%x", msgID),
-		Data:      ciphertext,
-		Nonce:     nonce,
-		Timestamp: time.Now(),
-		TTL:       24 * time.Hour,
-	}, nil
 }
 
-func (s *Server) decryptMessage(msg *EncryptedMessage) ([]byte, error) {
-	return s.gcm.Open(nil, msg.Nonce, msg.Data, nil)
+func (s *Server) getClient(clientID string) (*Client, bool) {
+	s.clientsMux.RLock()
+	defer s.clientsMux.RUnlock()
+	client, exists := s.clients[clientID]
+	return client, exists
 }
 
-func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade error: %v", err)
@@ -109,151 +78,171 @@ func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	clientID := r.Header.Get("X-Client-ID")
+	clientID := r.URL.Query().Get("id")
 	if clientID == "" {
-		conn.WriteMessage(websocket.TextMessage, []byte("ERROR: Missing client ID"))
+		log.Printf("Missing client ID")
 		return
 	}
 
 	client := &Client{
 		ID:       clientID,
 		Conn:     conn,
-		LastSeen: time.Now(),
+		Send:     make(chan []byte, 256),
+		server:   s,
+		lastSeen: time.Now(),
 	}
 
-	s.mu.Lock()
-	s.clients[clientID] = client
-	s.mu.Unlock()
+	s.addClient(client)
+	defer s.removeClient(clientID)
 
-	defer func() {
-		s.mu.Lock()
-		delete(s.clients, clientID)
-		s.mu.Unlock()
-	}()
+	go client.writePump()
+	client.readPump()
+}
+
+func (c *Client) readPump() {
+	defer c.Conn.Close()
+
+	c.Conn.SetReadLimit(1024)
+	c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.Conn.SetPongHandler(func(string) error {
+		c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
 
 	for {
-		_, message, err := conn.ReadMessage()
+		_, messageBytes, err := c.Conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error: %v", err)
+			}
 			break
 		}
 
-		var packet Packet
-		if err := json.Unmarshal(message, &packet); err != nil {
+		c.lastSeen = time.Now()
+
+		var msg Message
+		if err := json.Unmarshal(messageBytes, &msg); err != nil {
+			log.Printf("Invalid message format: %v", err)
 			continue
 		}
 
-		switch packet.Type {
-		case "message":
-			s.handleMessage(&packet)
-		case "get_messages":
-			s.handleGetMessages(client, &packet)
-		case "key_exchange":
-			s.handleKeyExchange(&packet)
-		}
+		msg.From = c.ID
+		msg.Timestamp = time.Now()
 
-		client.LastSeen = time.Now()
-	}
-}
-
-func (s *Server) handleMessage(packet *Packet) {
-	encMsg, err := s.encryptMessage(packet.Data)
-	if err != nil {
-		log.Printf("Encryption error: %v", err)
-		return
-	}
-
-	s.mu.Lock()
-	s.messages[encMsg.ID] = encMsg
-	s.mu.Unlock()
-
-	s.mu.RLock()
-	targetClient, exists := s.clients[packet.To]
-	s.mu.RUnlock()
-
-	if exists {
-		response := map[string]interface{}{
-			"type":   "new_message",
-			"from":   packet.From,
-			"msg_id": encMsg.ID,
-			"data":   packet.Data,
-		}
-		responseJSON, _ := json.Marshal(response)
-		targetClient.Conn.WriteMessage(websocket.TextMessage, responseJSON)
-	}
-}
-
-func (s *Server) handleGetMessages(client *Client, packet *Packet) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var messages []map[string]interface{}
-	for _, msg := range s.messages {
-		if time.Since(msg.Timestamp) < msg.TTL {
-			data, err := s.decryptMessage(msg)
-			if err != nil {
-				continue
+		if msg.Type == "message" && msg.To != "" {
+			if targetClient, exists := c.server.getClient(msg.To); exists {
+				messageBytes, _ := json.Marshal(msg)
+				select {
+				case targetClient.Send <- messageBytes:
+				default:
+					close(targetClient.Send)
+					c.server.removeClient(msg.To)
+				}
 			}
-
-			messages = append(messages, map[string]interface{}{
-				"id":        msg.ID,
-				"data":      data,
-				"timestamp": msg.Timestamp.Unix(),
-			})
 		}
-	}
-
-	response := map[string]interface{}{
-		"type":     "messages",
-		"messages": messages,
-	}
-	responseJSON, _ := json.Marshal(response)
-	client.Conn.WriteMessage(websocket.TextMessage, responseJSON)
-}
-
-func (s *Server) handleKeyExchange(packet *Packet) {
-	s.mu.RLock()
-	targetClient, exists := s.clients[packet.To]
-	s.mu.RUnlock()
-
-	if exists {
-		response := map[string]interface{}{
-			"type": "key_exchange",
-			"from": packet.From,
-			"data": packet.Data,
-		}
-		responseJSON, _ := json.Marshal(response)
-		targetClient.Conn.WriteMessage(websocket.TextMessage, responseJSON)
 	}
 }
 
-func (s *Server) cleanupExpiredMessages() {
-	ticker := time.NewTicker(10 * time.Minute)
+func (c *Client) writePump() {
+	ticker := time.NewTicker(54 * time.Second)
 	defer ticker.Stop()
+	defer c.Conn.Close()
 
-	for range ticker.C {
-		s.mu.Lock()
-		for id, msg := range s.messages {
-			if time.Since(msg.Timestamp) > msg.TTL {
-				for i := range msg.Data {
-					msg.Data[i] = 0
-				}
-				for i := range msg.Nonce {
-					msg.Nonce[i] = 0
-				}
-				delete(s.messages, id)
+	for {
+		select {
+		case message, ok := <-c.Send:
+			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if !ok {
+				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				log.Printf("Write error: %v", err)
+				return
+			}
+
+		case <-ticker.C:
+			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
 			}
 		}
-		s.mu.Unlock()
+	}
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	s.clientsMux.RLock()
+	clientCount := len(s.clients)
+	s.clientsMux.RUnlock()
+
+	status := map[string]interface{}{
+		"status":  "running",
+		"clients": clientCount,
+	}
+
+	json.NewEncoder(w).Encode(status)
+}
+
+func setupTLS() *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		},
 	}
 }
 
 func main() {
+	certFile := "/etc/ssl/j20s/cert.pem"
+	keyFile := "/etc/ssl/j20s/key.pem"
+
+	if len(os.Args) > 2 {
+		certFile = os.Args[1]
+		keyFile = os.Args[2]
+	}
+
 	server := NewServer()
 
-	go server.cleanupExpiredMessages()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", server.handleWebSocket)
+	mux.HandleFunc("/api/status", server.handleStatus)
 
-	http.HandleFunc("/ws", server.handleConnection)
+	httpServer := &http.Server{
+		Addr:         ":8443",
+		Handler:      mux,
+		TLSConfig:    setupTLS(),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
 
-	fmt.Println("Secure server starting on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Printf("J20S Server starting on :8443")
+	log.Printf("TLS cert: %s", certFile)
+	log.Printf("TLS key: %s", keyFile)
+
+	go func() {
+		if err := httpServer.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
+
+	log.Printf("Server shutting down...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Printf("Server shutdown error: %v", err)
+	}
+
+	log.Printf("Server stopped")
 }
